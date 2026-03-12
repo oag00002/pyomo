@@ -607,6 +607,19 @@ def deactivate_model_at_non_colloc_points(block, reclassified_list):
             % ', '.join(ds_info)
         )
 
+    for b in block.component_objects(Block, descend_into=True):
+        if b.is_indexed():
+            for subset in b.index_set().subsets():
+                if subset.name in ds_info:
+                    logger.warning(
+                        "clean_model='deactivate' was requested but the model "
+                        "contains a Block '%s' indexed over ContinuousSet '%s'. "
+                        "Cleanup of components inside indexed Blocks is not "
+                        "supported and may produce errors or an incomplete result."
+                        % (b.name, subset.name)
+                    )
+                    break
+
     protected = ('_disc_eq', '_cont_eq')
     for con in block.component_objects(Constraint, descend_into=True):
         if any(con.local_name.endswith(s) for s in protected):
@@ -664,6 +677,19 @@ def delete_model_at_non_colloc_points(block, reclassified_list):
             "those needed for spatial boundary conditions."
             % ', '.join(ds_info)
         )
+
+    for b in block.component_objects(Block, descend_into=True):
+        if b.is_indexed():
+            for subset in b.index_set().subsets():
+                if subset.name in ds_info:
+                    logger.warning(
+                        "clean_model='delete' was requested but the model "
+                        "contains a Block '%s' indexed over ContinuousSet '%s'. "
+                        "Cleanup of components inside indexed Blocks is not "
+                        "supported and may produce errors or an incomplete result."
+                        % (b.name, subset.name)
+                    )
+                    break
 
     protected = ('_disc_eq', '_cont_eq')
     for con in block.component_objects(Constraint, descend_into=True):

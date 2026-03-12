@@ -477,8 +477,6 @@ class Collocation_Discretization_Transformation(Transformation):
 
         self._transformBlock(instance, currentds)
 
-        # TODO: Make sure this either works for PDEs or raises an error message if used for PDEs
-
     def _transformBlock(self, block, currentds):
         self._fe = {}
         for ds in block.component_objects(ContinuousSet, descend_into=True):
@@ -515,9 +513,6 @@ class Collocation_Discretization_Transformation(Transformation):
                 disc_info['scheme'] = self._scheme_name
 
         expand_components(block)
-
-        # NOTE: Probably best to expand the components first then delete the points created at non-collocation points
-        # EDGE CASE: Blocks can be indexed by the continuous set.
 
         for d in block.component_objects(DerivativeVar, descend_into=True):
             dsets = d.get_continuousset_list()
@@ -561,7 +556,6 @@ class Collocation_Discretization_Transformation(Transformation):
                 )
                 if reclassified_list is None:
                     block._pyomo_dae_reclassified_derivativevars = list()
-                    # NOTE: This list probably is what can be used to loop over the derivative vars
                     reclassified_list = block._pyomo_dae_reclassified_derivativevars
 
                 reclassified_list.append(d)
@@ -605,6 +599,8 @@ class Collocation_Discretization_Transformation(Transformation):
                     delete_model_at_non_colloc_points(
                         block, reclassified_list
                     )
+        
+        # TODO: Add compatibility for PDEs and blocks indexed over the continuous set.
 
     def reduce_collocation_points(self, instance, var=None, ncp=None, contset=None):
         """
