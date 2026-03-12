@@ -10,7 +10,15 @@
 
 import pyomo.common.unittest as unittest
 
-from pyomo.environ import Var, Set, Constraint, ConcreteModel, TransformationFactory, pyomo
+from pyomo.environ import (
+    Block,
+    Constraint,
+    ConcreteModel,
+    Set,
+    TransformationFactory,
+    Var,
+    pyomo,
+)
 from pyomo.dae import ContinuousSet, DerivativeVar
 from pyomo.dae.diffvar import DAE_Error
 
@@ -873,6 +881,76 @@ class TestCleanModel(unittest.TestCase):
         disc = TransformationFactory('dae.collocation')
         with self.assertRaises(Exception):
             disc.apply_to(m, nfe=2, ncp=2, clean_model='bad_value')
+
+    def _make_two_cs_model(self):
+        """Two independent ODEs on separate ContinuousSets (simulates multi-CS scenario)."""
+        m = ConcreteModel()
+        m.t = ContinuousSet(bounds=(0, 1))
+        m.z = ContinuousSet(bounds=(0, 1))
+        m.v1 = Var(m.t)
+        m.dv1 = DerivativeVar(m.v1, wrt=m.t)
+        m.v2 = Var(m.z)
+        m.dv2 = DerivativeVar(m.v2, wrt=m.z)
+        m.ode1 = Constraint(m.t, rule=lambda m, t: m.dv1[t] == -m.v1[t])
+        m.ode2 = Constraint(m.z, rule=lambda m, z: m.dv2[z] == -m.v2[z])
+        return m
+
+    def test_pde_warning(self):
+        """clean_model warns when multiple ContinuousSets appear in reclassified list
+        (simulates PDE scenario with collocation applied to both dimensions)."""
+        m = self._make_two_cs_model()
+        # Discretize z first (no clean_model); dv2 is added to reclassified list
+        disc1 = TransformationFactory('dae.collocation')
+        disc1.apply_to(m, wrt=m.z, nfe=2, ncp=2)
+        # Discretize t with clean_model='delete'; cleanup now sees both dv2 and dv1
+        disc2 = TransformationFactory('dae.collocation')
+        output = StringIO()
+        with LoggingIntercept(output, 'pyomo.dae'):
+            disc2.apply_to(m, wrt=m.t, nfe=2, ncp=2, clean_model='delete')
+        self.assertIn('multiple ContinuousSets', output.getvalue())
+
+    def test_block_indexed_over_cs_warning(self):
+        """clean_model warns when a Block is indexed over a ContinuousSet."""
+        m = self._make_ode_model()
+        m.b = Block(m.t)
+        disc = TransformationFactory('dae.collocation')
+        output = StringIO()
+        with LoggingIntercept(output, 'pyomo.dae'):
+            disc.apply_to(m, nfe=2, ncp=2, clean_model='delete')
+        self.assertIn('indexed Blocks is not supported', output.getvalue())
+
+    def test_chained_colloc_last_warning(self):
+        """clean_model warns when collocation is the last discretization in a chain
+        (FD on z first, collocation on t second with clean_model='delete')."""
+        m = self._make_two_cs_model()
+        # FD on z reclassifies dv2 without cleanup
+        disc_fd = TransformationFactory('dae.finite_difference')
+        disc_fd.apply_to(m, wrt=m.z, nfe=2)
+        # Collocation on t now sees [dv2, dv1] in reclassified list → multi-CS warning
+        disc_colloc = TransformationFactory('dae.collocation')
+        output = StringIO()
+        with LoggingIntercept(output, 'pyomo.dae'):
+            disc_colloc.apply_to(m, wrt=m.t, nfe=2, ncp=2, clean_model='delete')
+        self.assertIn('multiple ContinuousSets', output.getvalue())
+
+    def test_chained_colloc_first_no_warning(self):
+        """No multi-CS warning when collocation with clean_model runs first;
+        cleanup still removes non-collocation t entries before FD runs on z."""
+        m = self._make_two_cs_model()
+        # Collocation on t first: only dv1 in reclassified list → single CS, no warning
+        disc_colloc = TransformationFactory('dae.collocation')
+        output = StringIO()
+        with LoggingIntercept(output, 'pyomo.dae'):
+            disc_colloc.apply_to(m, wrt=m.t, nfe=2, ncp=2, clean_model='delete')
+        self.assertNotIn('multiple ContinuousSets', output.getvalue())
+        # Cleanup should have removed t0 entries from dv1 and ode1
+        t0 = m.t.first()
+        self.assertNotIn(t0, m.dv1)
+        self.assertNotIn(t0, m.ode1)
+        self.assertIn(t0, m.v1)
+        # FD on z runs without issues afterward
+        disc_fd = TransformationFactory('dae.finite_difference')
+        disc_fd.apply_to(m, wrt=m.z, nfe=2)
 
 
 if __name__ == '__main__':
