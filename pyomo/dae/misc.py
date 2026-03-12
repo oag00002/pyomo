@@ -505,3 +505,195 @@ def _get_idx(l, ds, n, i, k):
         if not isinstance(n, tuple):
             tmpn = (n,)
     return tmpn[0:l] + (tik,) + tmpn[l:]
+
+
+def get_non_collocation_indices(d, ds):
+    """Return the set of values in ContinuousSet ds that are NOT
+    collocation points for DerivativeVar d.
+
+    Uses d's disc_eq constraint (which skips non-collocation points via
+    Constraint.Skip) as the authoritative source. Works for both
+    LAGRANGE-RADAU (skips t_0 only) and LAGRANGE-LEGENDRE (skips all FE
+    boundaries).
+
+    Parameters
+    ----------
+    d : DerivativeVar reclassified as Var after discretization
+    ds : ContinuousSet
+
+    Returns
+    -------
+    set of time values that are non-collocation points
+    """
+    disc_eq_name = d.local_name + '_disc_eq'
+    disc_eq = d.parent_block().find_component(disc_eq_name)
+    if disc_eq is None:
+        return set()
+
+    all_t = set(ds)
+    loc = d.get_state_var()._contset[ds]
+
+    colloc_t = set()
+    for idx in disc_eq:
+        t_val = idx[loc] if isinstance(idx, tuple) else idx
+        colloc_t.add(t_val)
+
+    return all_t - colloc_t
+
+
+def _get_ds_flat_positions(comp, ds_name_to_info):
+    """Return list of (ds_name, flat_tuple_position) for each ContinuousSet
+    in ds_name_to_info that appears in comp's index set.
+
+    Uses the same dimension-summing approach as get_index_information to
+    compute the correct flat tuple offset for each subset.
+
+    Parameters
+    ----------
+    comp : indexed Pyomo component (Var or Constraint)
+    ds_name_to_info : dict mapping ds_name -> (non_colloc_set, ds_object)
+
+    Returns
+    -------
+    list of (ds_name, int) pairs; empty if no matching ContinuousSet found
+    """
+    result = []
+    flat_pos = 0
+    for subset in comp.index_set().subsets():
+        if subset.name in ds_name_to_info:
+            result.append((subset.name, flat_pos))
+        flat_pos += (subset.dimen or 1)
+    return result
+
+
+def deactivate_model_at_non_colloc_points(block, reclassified_list):
+    """Deactivate user Constraints at non-collocation points.
+
+    Skips *_disc_eq and *_cont_eq constraints (already correct). Scalar
+    (non-indexed) constraints such as initial condition equations are also
+    skipped automatically.
+
+    Note: Pyomo VarData has no deactivate() interface, so only Constraints
+    are processed here. Derivative and algebraic variable entries at
+    non-collocation points remain as free variables. Use
+    clean_model='delete' to fully remove those entries.
+
+    Parameters
+    ----------
+    block : Pyomo Block
+    reclassified_list : list
+        The _pyomo_dae_reclassified_derivativevars list from the block,
+        containing DerivativeVar components reclassified as Var.
+    """
+    ds_info = {}
+    for d in reclassified_list:
+        for contset in d._wrt:
+            if contset.name not in ds_info:
+                ds_info[contset.name] = (
+                    get_non_collocation_indices(d, contset),
+                    contset,
+                )
+
+    if not ds_info:
+        return
+
+    if len(ds_info) > 1:
+        logger.warning(
+            "clean_model='deactivate' was applied to a model with multiple "
+            "ContinuousSets (%s). This option was designed for ODE/DAE systems. "
+            "For PDE systems, constraints and variables at non-collocation points "
+            "in spatial dimensions may be inadvertently deactivated, including "
+            "those needed for spatial boundary conditions."
+            % ', '.join(ds_info)
+        )
+
+    protected = ('_disc_eq', '_cont_eq')
+    for con in block.component_objects(Constraint, descend_into=True):
+        if any(con.local_name.endswith(s) for s in protected):
+            continue
+        if not con.is_indexed():
+            continue
+        ds_positions = _get_ds_flat_positions(con, ds_info)
+        if not ds_positions:
+            continue
+        for idx in list(con):
+            for ds_name, loc in ds_positions:
+                non_colloc, _ = ds_info[ds_name]
+                t_val = idx[loc] if isinstance(idx, tuple) else idx
+                if t_val in non_colloc:
+                    con[idx].deactivate()
+                    break
+
+
+def delete_model_at_non_colloc_points(block, reclassified_list):
+    """Delete variable and constraint entries at non-collocation points.
+
+    Preserves all state variable entries (needed for initial conditions
+    and continuity equations). Preserves *_disc_eq and *_cont_eq
+    constraints. Scalar (non-indexed) constraints are left untouched.
+
+    Parameters
+    ----------
+    block : Pyomo Block
+    reclassified_list : list
+        The _pyomo_dae_reclassified_derivativevars list from the block,
+        containing DerivativeVar components reclassified as Var.
+    """
+    ds_info = {}
+    state_var_ids = set()
+
+    for d in reclassified_list:
+        svar = d.get_state_var()
+        state_var_ids.add(id(svar))
+        for contset in d._wrt:
+            if contset.name not in ds_info:
+                ds_info[contset.name] = (
+                    get_non_collocation_indices(d, contset),
+                    contset,
+                )
+
+    if not ds_info:
+        return
+
+    if len(ds_info) > 1:
+        logger.warning(
+            "clean_model='delete' was applied to a model with multiple "
+            "ContinuousSets (%s). This option was designed for ODE/DAE systems. "
+            "For PDE systems, constraints and variables at non-collocation points "
+            "in spatial dimensions may be inadvertently deleted, including "
+            "those needed for spatial boundary conditions."
+            % ', '.join(ds_info)
+        )
+
+    protected = ('_disc_eq', '_cont_eq')
+    for con in block.component_objects(Constraint, descend_into=True):
+        if any(con.local_name.endswith(s) for s in protected):
+            continue
+        if not con.is_indexed():
+            continue
+        ds_positions = _get_ds_flat_positions(con, ds_info)
+        if not ds_positions:
+            continue
+        for idx in list(con):
+            for ds_name, loc in ds_positions:
+                non_colloc, _ = ds_info[ds_name]
+                t_val = idx[loc] if isinstance(idx, tuple) else idx
+                if t_val in non_colloc:
+                    del con[idx]
+                    break
+
+    for var in block.component_objects(Var, descend_into=True):
+        if id(var) in state_var_ids:
+            continue
+        if not var.is_indexed():
+            continue
+        ds_positions = _get_ds_flat_positions(var, ds_info)
+        if not ds_positions:
+            continue
+        for idx in list(var):
+            for ds_name, loc in ds_positions:
+                non_colloc, _ = ds_info[ds_name]
+                t_val = idx[loc] if isinstance(idx, tuple) else idx
+                if t_val in non_colloc:
+                    del var[idx]
+                    break

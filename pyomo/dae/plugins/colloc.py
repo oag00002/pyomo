@@ -30,6 +30,8 @@ from pyomo.dae.misc import add_discretization_equations
 from pyomo.dae.misc import add_continuity_equations
 from pyomo.dae.misc import block_fully_discretized
 from pyomo.dae.misc import get_index_information
+from pyomo.dae.misc import deactivate_model_at_non_colloc_points
+from pyomo.dae.misc import delete_model_at_non_colloc_points
 from pyomo.dae.diffvar import DAE_Error
 
 from pyomo.common.config import ConfigBlock, ConfigValue, PositiveInt, In
@@ -299,6 +301,19 @@ class Collocation_Discretization_Transformation(Transformation):
         ),
     )
 
+    CONFIG.declare(
+        'clean_model',
+        ConfigValue(
+            default='none',
+            domain=In(['none', 'deactivate', 'delete']),
+            description="Indicates whether to remove or deactivate model "
+            "components at non-collocation points after discretization. "
+            "'none' (default): no cleanup. 'deactivate': deactivate user "
+            "constraints at non-collocation points. 'delete': permanently "
+            "delete variable and constraint entries at non-collocation points.",
+        ),
+    )
+
     def __init__(self):
         super(Collocation_Discretization_Transformation, self).__init__()
         self._ncp = {}
@@ -453,6 +468,7 @@ class Collocation_Discretization_Transformation(Transformation):
 
         self._scheme_name = config.scheme
         self._scheme = self.all_schemes.get(self._scheme_name, None)
+        self._clean_model = config.clean_model
 
         if self._scheme_name == 'LAGRANGE-RADAU':
             self._get_radau_constants(currentds)
@@ -460,6 +476,8 @@ class Collocation_Discretization_Transformation(Transformation):
             self._get_legendre_constants(currentds)
 
         self._transformBlock(instance, currentds)
+
+        # TODO: Make sure this either works for PDEs or raises an error message if used for PDEs
 
     def _transformBlock(self, block, currentds):
         self._fe = {}
@@ -497,6 +515,9 @@ class Collocation_Discretization_Transformation(Transformation):
                 disc_info['scheme'] = self._scheme_name
 
         expand_components(block)
+
+        # NOTE: Probably best to expand the components first then delete the points created at non-collocation points
+        # EDGE CASE: Blocks can be indexed by the continuous set.
 
         for d in block.component_objects(DerivativeVar, descend_into=True):
             dsets = d.get_continuousset_list()
@@ -540,6 +561,7 @@ class Collocation_Discretization_Transformation(Transformation):
                 )
                 if reclassified_list is None:
                     block._pyomo_dae_reclassified_derivativevars = list()
+                    # NOTE: This list probably is what can be used to loop over the derivative vars
                     reclassified_list = block._pyomo_dae_reclassified_derivativevars
 
                 reclassified_list.append(d)
@@ -568,6 +590,21 @@ class Collocation_Discretization_Transformation(Transformation):
                     k.clear()
                     k._constructed = False
                     k.construct()
+
+        # Clean up redundant equations at non-collocation points if requested
+        if self._clean_model != 'none':
+            reclassified_list = getattr(
+                block, '_pyomo_dae_reclassified_derivativevars', []
+            )
+            if reclassified_list:
+                if self._clean_model == 'deactivate':
+                    deactivate_model_at_non_colloc_points(
+                        block, reclassified_list
+                    )
+                elif self._clean_model == 'delete':
+                    delete_model_at_non_colloc_points(
+                        block, reclassified_list
+                    )
 
     def reduce_collocation_points(self, instance, var=None, ncp=None, contset=None):
         """

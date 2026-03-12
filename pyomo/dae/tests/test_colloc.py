@@ -10,7 +10,7 @@
 
 import pyomo.common.unittest as unittest
 
-from pyomo.environ import Var, Set, ConcreteModel, TransformationFactory, pyomo
+from pyomo.environ import Var, Set, Constraint, ConcreteModel, TransformationFactory, pyomo
 from pyomo.dae import ContinuousSet, DerivativeVar
 from pyomo.dae.diffvar import DAE_Error
 
@@ -724,6 +724,155 @@ class TestCollocation(unittest.TestCase):
 
         self.assertTrue(hasattr(m3, 'u_interpolation_constraints'))
         self.assertEqual(len(m3.u_interpolation_constraints), 15)
+
+
+class TestCleanModel(unittest.TestCase):
+    """Tests for the clean_model flag on the collocation transformation."""
+
+    def _make_ode_model(self):
+        """Simple ODE model: dv1/dt = -v1, with algebraic variable v2."""
+        m = ConcreteModel()
+        m.t = ContinuousSet(bounds=(0, 10))
+        m.v1 = Var(m.t)
+        m.dv1 = DerivativeVar(m.v1)
+        m.v2 = Var(m.t)  # algebraic variable
+        m.ode = Constraint(m.t, rule=lambda m, t: m.dv1[t] == -m.v1[t])
+        m.alg = Constraint(m.t, rule=lambda m, t: m.v2[t] == m.v1[t] ** 2)
+        return m
+
+    def test_default_no_cleanup(self):
+        """clean_model='none' (default) leaves the model untouched."""
+        m = self._make_ode_model()
+        disc = TransformationFactory('dae.collocation')
+        disc.apply_to(m, nfe=2, ncp=2)
+        t0 = m.t.first()
+        # At t0, ode and alg should still be present and active
+        self.assertIn(t0, m.ode)
+        self.assertTrue(m.ode[t0].active)
+        self.assertIn(t0, m.alg)
+        self.assertTrue(m.alg[t0].active)
+        # disc_eq should be untouched
+        self.assertEqual(len(m.dv1_disc_eq), 4)
+
+    def test_deactivate_radau(self):
+        """clean_model='deactivate' deactivates constraints at t0 for RADAU."""
+        m = self._make_ode_model()
+        disc = TransformationFactory('dae.collocation')
+        disc.apply_to(m, nfe=2, ncp=2, clean_model='deactivate')
+        t0 = m.t.first()
+        # User constraints at t0 should be inactive
+        self.assertFalse(m.ode[t0].active)
+        self.assertFalse(m.alg[t0].active)
+        # Collocation point constraints should still be active
+        fe = m.t.get_finite_elements()
+        # For RADAU, right FE boundary (fe[1]) is a collocation point
+        self.assertTrue(m.ode[fe[1]].active)
+        self.assertTrue(m.alg[fe[1]].active)
+        # disc_eq must be completely untouched
+        self.assertEqual(len(m.dv1_disc_eq), 4)
+        # State variable entry at t0 must still exist
+        self.assertIn(t0, m.v1)
+
+    def test_delete_radau(self):
+        """clean_model='delete' removes constraint and variable entries at t0 for RADAU."""
+        m = self._make_ode_model()
+        disc = TransformationFactory('dae.collocation')
+        disc.apply_to(m, nfe=2, ncp=2, clean_model='delete')
+        t0 = m.t.first()
+        # User constraints at t0 should be gone
+        self.assertNotIn(t0, m.ode)
+        self.assertNotIn(t0, m.alg)
+        # Derivative and algebraic variable entries at t0 should be gone
+        self.assertNotIn(t0, m.dv1)
+        self.assertNotIn(t0, m.v2)
+        # State variable entry at t0 must be preserved
+        self.assertIn(t0, m.v1)
+        # disc_eq must be completely untouched
+        self.assertEqual(len(m.dv1_disc_eq), 4)
+        # Collocation point entries should still exist
+        fe = m.t.get_finite_elements()
+        self.assertIn(fe[1], m.ode)
+        self.assertIn(fe[1], m.dv1)
+
+    def test_deactivate_legendre(self):
+        """clean_model='deactivate' deactivates constraints at all FE boundaries for LEGENDRE."""
+        m = self._make_ode_model()
+        disc = TransformationFactory('dae.collocation')
+        disc.apply_to(m, nfe=2, ncp=2, scheme='LAGRANGE-LEGENDRE', clean_model='deactivate')
+        fe = m.t.get_finite_elements()
+        # All FE boundaries are non-collocation points for Legendre
+        for t_fe in fe:
+            self.assertFalse(m.ode[t_fe].active, f"ode[{t_fe}] should be inactive")
+            self.assertFalse(m.alg[t_fe].active, f"alg[{t_fe}] should be inactive")
+        # Interior (collocation point) constraints should still be active
+        non_fe = [t for t in m.t if t not in fe]
+        for t_cp in non_fe:
+            self.assertTrue(m.ode[t_cp].active, f"ode[{t_cp}] should be active")
+        # cont_eq and disc_eq must be completely untouched
+        self.assertEqual(len(m.dv1_disc_eq), 4)
+        self.assertEqual(len(m.v1_t_cont_eq), 2)
+        # State variable must exist at all FE boundaries
+        for t_fe in fe:
+            self.assertIn(t_fe, m.v1)
+
+    def test_delete_legendre(self):
+        """clean_model='delete' removes constraint and variable entries at FE boundaries for LEGENDRE."""
+        m = self._make_ode_model()
+        disc = TransformationFactory('dae.collocation')
+        disc.apply_to(m, nfe=2, ncp=2, scheme='LAGRANGE-LEGENDRE', clean_model='delete')
+        fe = m.t.get_finite_elements()
+        # All FE boundaries should be absent from user constraints and non-state vars
+        for t_fe in fe:
+            self.assertNotIn(t_fe, m.ode, f"ode[{t_fe}] should be deleted")
+            self.assertNotIn(t_fe, m.alg, f"alg[{t_fe}] should be deleted")
+            self.assertNotIn(t_fe, m.dv1, f"dv1[{t_fe}] should be deleted")
+            self.assertNotIn(t_fe, m.v2, f"v2[{t_fe}] should be deleted")
+            # State variable must be preserved at FE boundaries (needed for cont_eq)
+            self.assertIn(t_fe, m.v1, f"v1[{t_fe}] should be preserved")
+        # disc_eq and cont_eq must be completely untouched
+        self.assertEqual(len(m.dv1_disc_eq), 4)
+        self.assertEqual(len(m.v1_t_cont_eq), 2)
+
+    def test_multi_index_var_delete(self):
+        """clean_model='delete' handles Var(m.s, m.t) with correct index position."""
+        m = ConcreteModel()
+        m.t = ContinuousSet(bounds=(0, 10))
+        m.s = Set(initialize=[1, 2, 3])
+        m.v1 = Var(m.t)
+        m.dv1 = DerivativeVar(m.v1)
+        m.u = Var(m.s, m.t)  # algebraic: s is first index, t is second
+        m.ode = Constraint(m.t, rule=lambda m, t: m.dv1[t] == -m.v1[t])
+        m.alg = Constraint(m.s, m.t, rule=lambda m, s, t: m.u[s, t] == m.v1[t])
+
+        disc = TransformationFactory('dae.collocation')
+        disc.apply_to(m, nfe=1, ncp=2, clean_model='delete')
+        t0 = m.t.first()
+
+        # All (s, t0) entries of the algebraic variable should be gone
+        for si in [1, 2, 3]:
+            self.assertNotIn((si, t0), m.u)
+        # The constraint at t0 should be gone
+        self.assertNotIn(t0, m.ode)
+        for si in [1, 2, 3]:
+            self.assertNotIn((si, t0), m.alg)
+        # State variable must still have t0
+        self.assertIn(t0, m.v1)
+
+    def test_scalar_ic_preserved(self):
+        """Scalar initial condition constraints are not affected by clean_model='delete'."""
+        m = self._make_ode_model()
+        m.ic = Constraint(expr=m.v1[0] == 1.0)
+        disc = TransformationFactory('dae.collocation')
+        disc.apply_to(m, nfe=2, ncp=2, clean_model='delete')
+        # The scalar IC constraint must still be active
+        self.assertTrue(m.ic.active)
+
+    def test_invalid_option(self):
+        """An invalid clean_model value raises an error during apply_to."""
+        m = self._make_ode_model()
+        disc = TransformationFactory('dae.collocation')
+        with self.assertRaises(Exception):
+            disc.apply_to(m, nfe=2, ncp=2, clean_model='bad_value')
 
 
 if __name__ == '__main__':
