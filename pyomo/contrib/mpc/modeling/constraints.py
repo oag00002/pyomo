@@ -41,20 +41,44 @@ def get_piecewise_constant_constraints(inputs, time, sample_points, use_next=Tru
     def piecewise_constant_rule(m, i, t):
         if t in sample_point_set:
             return Constraint.Skip
+        # I think whether we want prev or next here depends on whether
+        # we use an explicit or implicit time discretization. I.e. whether
+        # an input is applied to the finite element in front of or behind
+        # its time point. If the wrong direction for a discretization
+        # is used, we could have different inputs applied within the same
+        # finite element, which I think we never want.
+        var = inputs[i]
+        # Guard: if t has no VarData (e.g. deleted by clean_model='delete'),
+        # there is nothing to constrain.
+        if t not in var:
+            return Constraint.Skip
+        if use_next:
+            t_next = time.next(t)
+            # Walk forward past any deleted non-collocation points that are
+            # neither a sample boundary nor an existing VarData entry.
+            while (
+                t_next not in var
+                and t_next not in sample_point_set
+                and t_next != time.last()
+            ):
+                t_next = time.next(t_next)
+            # Skip if no valid VarData was found (e.g. the next available
+            # point is a deleted sample boundary).
+            if t_next not in var:
+                return Constraint.Skip
+            return var[t] - var[t_next] == 0
         else:
-            # I think whether we want prev or next here depends on whether
-            # we use an explicit or implicit time discretization. I.e. whether
-            # an input is applied to the finite element in front of or behind
-            # its time point. If the wrong direction for a discretization
-            # is used, we could have different inputs applied within the same
-            # finite element, which I think we never want.
-            var = inputs[i]
-            if use_next:
-                t_next = time.next(t)
-                return var[t] - var[t_next] == 0
-            else:
-                t_prev = time.prev(t)
-                return var[t_prev] - var[t] == 0
+            t_prev = time.prev(t)
+            # Walk backward past deleted non-collocation points.
+            while (
+                t_prev not in var
+                and t_prev not in sample_point_set
+                and t_prev != time.first()
+            ):
+                t_prev = time.prev(t_prev)
+            if t_prev not in var:
+                return Constraint.Skip
+            return var[t_prev] - var[t] == 0
 
     pwc_con = Constraint(input_set, time, rule=piecewise_constant_rule)
     return input_set, pwc_con

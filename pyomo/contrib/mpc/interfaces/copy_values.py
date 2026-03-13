@@ -46,4 +46,5 @@ def copy_values_at_time(
             # for variables. However, it raises an error if the expression
             # cannot be evaluated (e.g. has value None).
             # t_var[t_t].set_value(pyo_value(s_var[s_t]))
-            t_var[t_t].set_value(s_var[s_t].value)
+            if s_t in s_var and t_t in t_var:
+                t_var[t_t].set_value(s_var[s_t].value)

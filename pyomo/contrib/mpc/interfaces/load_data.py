@@ -39,9 +39,11 @@ def load_data_from_scalar(data, model, time):
         # doesn't have a list of time points to check.
         if var.is_indexed():
             for t in t_iter:
-                var[t].set_value(val)
+                if t in var and val is not None:
+                    var[t].set_value(val)
         else:
-            var.set_value(val)
+            if val is not None:
+                var.set_value(val)
 
 
 def load_data_from_series(data, model, time, tolerance=0.0):
@@ -74,7 +76,8 @@ def load_data_from_series(data, model, time, tolerance=0.0):
             _raise_invalid_cuid(cuid, model)
         for idx, val in zip(time_indices, vals):
             t = time_list[idx]
-            var[t].set_value(val)
+            if t in var:
+                var[t].set_value(val)
 
 
 def load_data_from_interval(
@@ -176,4 +179,5 @@ def load_data_from_interval(
                 # cover the entire time set.
                 continue
             else:
-                var[t].set_value(vals[i])
+                if t in var:
+                    var[t].set_value(vals[i])

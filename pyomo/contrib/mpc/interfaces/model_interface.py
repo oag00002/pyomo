@@ -134,7 +134,7 @@ class DynamicModelInterface:
             # Assume time is iterable
             time_list = list(time)
             data = {
-                cuid: [var[t].value for t in time]
+                cuid: [var[t].value if t in var else None for t in time]
                 for cuid, var in zip(self._dae_var_cuids, self._dae_vars)
             }
             if include_expr:
@@ -148,10 +148,24 @@ class DynamicModelInterface:
             return TimeSeriesData(data, time_list, time_set=self.time)
         else:
             # time is a scalar
-            data = {
-                cuid: var[time].value
-                for cuid, var in zip(self._dae_var_cuids, self._dae_vars)
-            }
+            time_list = list(self.time)
+            data = {}
+            for cuid, var in zip(self._dae_var_cuids, self._dae_vars):
+                if time in var:
+                    data[cuid] = var[time].value
+                else:
+                    # time is not a valid key for this variable (e.g., a
+                    # deleted FE boundary with clean_model='delete').
+                    # Fall back to the nearest existing time point so that
+                    # callers can still extract meaningful values (e.g., the
+                    # optimal input at a sample boundary that coincides with
+                    # a deleted FE boundary).
+                    var_keys = sorted(var._data.keys())
+                    if var_keys:
+                        idx = find_nearest_index(var_keys, time, tolerance=None)
+                        data[cuid] = var[var_keys[idx]].value
+                    else:
+                        data[cuid] = None
             if include_expr:
                 data.update(
                     {
@@ -255,32 +269,40 @@ class DynamicModelInterface:
         seen = set()
         t0 = self.time.first()
         tf = self.time.last()
-        time_map = {}
         time_list = list(self.time)
         for var in self._dae_vars:
-            if id(var[tf]) in seen:
-                # Assume that if var[tf] has been encountered, this is a
-                # reference to a "variable" we have already processed.
+            # Find a representative existing VarData for deduplication.
+            # var[tf] would create a new entry if tf was deleted (e.g. LEGENDRE
+            # with clean_model='delete'), so fall back to t0 or the first key.
+            _rep = (
+                var[tf] if tf in var
+                else (var[t0] if t0 in var else next(iter(var.values()), None))
+            )
+            if _rep is None or id(_rep) in seen:
+                # Assume this is a reference to a variable we have already processed.
                 continue
-            else:
-                seen.add(id(var[tf]))
+            seen.add(id(_rep))
+            # Build a time list from only the existing keys of this variable so
+            # that we never read from or write to deleted VarData entries.
+            var_time_list = [t for t in time_list if t in var]
+            var_time_map = {}
             new_values = []
-            for t in time_list:
-                if t not in time_map:
+            for t in var_time_list:
+                if t not in var_time_map:
                     # Build up a map from target to source time points,
                     # as I don't want to call find_nearest_index more
                     # frequently than I have to.
                     t_new = t + dt
-                    idx = find_nearest_index(time_list, t_new, tolerance=None)
+                    idx = find_nearest_index(var_time_list, t_new, tolerance=None)
                     # If t_new is not a valid time point, we proceed with the
                     # closest valid time point.
                     # We're relying on the fact that indices of t0 or tf are
                     # returned if t_new is outside the bounds of the time set.
-                    t_new = time_list[idx]
-                    time_map[t] = t_new
-                t_new = time_map[t]
+                    t_new = var_time_list[idx]
+                    var_time_map[t] = t_new
+                t_new = var_time_map[t]
                 new_values.append(var[t_new].value)
-            for i, t in enumerate(self.time):
+            for i, t in enumerate(var_time_list):
                 var[t].set_value(new_values[i])
 
     def get_penalty_from_target(
