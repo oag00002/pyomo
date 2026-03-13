@@ -19,7 +19,13 @@ from pyomo.contrib.mpc.interfaces.load_data import (
     load_data_from_series,
     load_data_from_interval,
 )
+from pyomo.contrib.mpc.interfaces.load_data_clean import (
+    load_data_from_scalar_clean,
+    load_data_from_series_clean,
+    load_data_from_interval_clean,
+)
 from pyomo.contrib.mpc.interfaces.copy_values import copy_values_at_time
+from pyomo.contrib.mpc.interfaces.copy_values_clean import copy_values_at_time_clean
 from pyomo.contrib.mpc.data.find_nearest_index import find_nearest_index
 from pyomo.contrib.mpc.data.get_cuid import get_indexed_cuid
 from pyomo.contrib.mpc.data.dynamic_data_base import _is_iterable
@@ -32,6 +38,9 @@ from pyomo.contrib.mpc.modeling.cost_expressions import (
     get_penalty_from_target,
 )
 from pyomo.contrib.mpc.modeling.constraints import get_piecewise_constant_constraints
+from pyomo.contrib.mpc.modeling.constraints_clean import (
+    get_piecewise_constant_constraints_clean,
+)
 
 iterable_scalars = (str, bytes)
 
@@ -58,10 +67,23 @@ class DynamicModelInterface:
 
     """
 
-    def __init__(self, model, time, context=NOTSET):
+    def __init__(self, model, time, context=NOTSET, clean_model=False):
         """
         Construct with a model and a set. We will flatten the model
         with respect to this set and generate CUIDs with wildcards.
+
+        Parameters
+        ----------
+        model: BlockData
+        time: Set
+        context: BlockData (optional)
+        clean_model: bool (optional, default False)
+            When True, all data-access operations (load_data, copy_values_at_time,
+            get_data_at_time, shift_values_by_time, get_piecewise_constant_constraints)
+            are routed through safe implementations that guard every variable access
+            with ``t in var``.  Set this to True when the model was discretized with
+            ``dae.collocation(clean_model='delete')`` to prevent deleted VarData
+            entries from being silently re-created.
 
         """
         scalar_vars, dae_vars = flatten_dae_components(model, time, Var)
@@ -72,6 +94,7 @@ class DynamicModelInterface:
         self._dae_vars = dae_vars
         self._scalar_expr = scalar_expr
         self._dae_expr = dae_expr
+        self._clean_model = clean_model
 
         if context is NOTSET:
             context = model
@@ -133,10 +156,18 @@ class DynamicModelInterface:
         if _is_iterable(time):
             # Assume time is iterable
             time_list = list(time)
-            data = {
-                cuid: [var[t].value for t in time]
-                for cuid, var in zip(self._dae_var_cuids, self._dae_vars)
-            }
+            if self._clean_model:
+                # Safe path: guard each access so deleted entries are not re-created.
+                # Returns None for time points whose VarData was deleted.
+                data = {
+                    cuid: [var[t].value if t in var else None for t in time]
+                    for cuid, var in zip(self._dae_var_cuids, self._dae_vars)
+                }
+            else:
+                data = {
+                    cuid: [var[t].value for t in time]
+                    for cuid, var in zip(self._dae_var_cuids, self._dae_vars)
+                }
             if include_expr:
                 data.update(
                     {
@@ -148,10 +179,25 @@ class DynamicModelInterface:
             return TimeSeriesData(data, time_list, time_set=self.time)
         else:
             # time is a scalar
-            data = {
-                cuid: var[time].value
-                for cuid, var in zip(self._dae_var_cuids, self._dae_vars)
-            }
+            if self._clean_model:
+                # Safe path: if the requested time point was deleted, fall back to
+                # the nearest existing time point in the variable's data.
+                data = {}
+                for cuid, var in zip(self._dae_var_cuids, self._dae_vars):
+                    if time in var:
+                        data[cuid] = var[time].value
+                    else:
+                        var_keys = sorted(var._data.keys())
+                        if var_keys:
+                            idx = find_nearest_index(var_keys, time, tolerance=None)
+                            data[cuid] = var[var_keys[idx]].value
+                        else:
+                            data[cuid] = None
+            else:
+                data = {
+                    cuid: var[time].value
+                    for cuid, var in zip(self._dae_var_cuids, self._dae_vars)
+                }
             if include_expr:
                 data.update(
                     {
@@ -211,23 +257,42 @@ class DynamicModelInterface:
             # This covers the case of non-time-indexed variables
             # as keys.
             _error_if_used(prefer_left, excl_left, excl_right, type(data))
-            load_data_from_scalar(data, self.model, time_points)
+            if self._clean_model:
+                load_data_from_scalar_clean(data, self.model, time_points)
+            else:
+                load_data_from_scalar(data, self.model, time_points)
         elif isinstance(data, TimeSeriesData):
             _error_if_used(prefer_left, excl_left, excl_right, type(data))
-            load_data_from_series(data, self.model, time_points, tolerance=tolerance)
+            if self._clean_model:
+                load_data_from_series_clean(
+                    data, self.model, time_points, tolerance=tolerance
+                )
+            else:
+                load_data_from_series(data, self.model, time_points, tolerance=tolerance)
         elif isinstance(data, IntervalData):
             prefer_left = True if prefer_left is None else prefer_left
             excl_left = prefer_left if excl_left is None else excl_left
             excl_right = (not prefer_left) if excl_right is None else excl_right
-            load_data_from_interval(
-                data,
-                self.model,
-                time_points,
-                tolerance=tolerance,
-                prefer_left=prefer_left,
-                exclude_left_endpoint=excl_left,
-                exclude_right_endpoint=excl_right,
-            )
+            if self._clean_model:
+                load_data_from_interval_clean(
+                    data,
+                    self.model,
+                    time_points,
+                    tolerance=tolerance,
+                    prefer_left=prefer_left,
+                    exclude_left_endpoint=excl_left,
+                    exclude_right_endpoint=excl_right,
+                )
+            else:
+                load_data_from_interval(
+                    data,
+                    self.model,
+                    time_points,
+                    tolerance=tolerance,
+                    prefer_left=prefer_left,
+                    exclude_left_endpoint=excl_left,
+                    exclude_right_endpoint=excl_right,
+                )
 
     def copy_values_at_time(self, source_time=None, target_time=None):
         """
@@ -246,42 +311,92 @@ class DynamicModelInterface:
             source_time = self.time.first()
         if target_time is None:
             target_time = self.time
-        copy_values_at_time(self._dae_vars, self._dae_vars, source_time, target_time)
+        if self._clean_model:
+            copy_values_at_time_clean(
+                self._dae_vars, self._dae_vars, source_time, target_time
+            )
+        else:
+            copy_values_at_time(
+                self._dae_vars, self._dae_vars, source_time, target_time
+            )
 
     def shift_values_by_time(self, dt):
         """
         Shift values in time indexed variables by a specified time offset.
         """
+        if self._clean_model:
+            self._shift_values_by_time_clean(dt)
+        else:
+            seen = set()
+            t0 = self.time.first()
+            tf = self.time.last()
+            time_map = {}
+            time_list = list(self.time)
+            for var in self._dae_vars:
+                if id(var[tf]) in seen:
+                    # Assume that if var[tf] has been encountered, this is a
+                    # reference to a "variable" we have already processed.
+                    continue
+                else:
+                    seen.add(id(var[tf]))
+                new_values = []
+                for t in time_list:
+                    if t not in time_map:
+                        # Build up a map from target to source time points,
+                        # as I don't want to call find_nearest_index more
+                        # frequently than I have to.
+                        t_new = t + dt
+                        idx = find_nearest_index(time_list, t_new, tolerance=None)
+                        # If t_new is not a valid time point, we proceed with the
+                        # closest valid time point.
+                        # We're relying on the fact that indices of t0 or tf are
+                        # returned if t_new is outside the bounds of the time set.
+                        t_new = time_list[idx]
+                        time_map[t] = t_new
+                    t_new = time_map[t]
+                    new_values.append(var[t_new].value)
+                for i, t in enumerate(self.time):
+                    var[t].set_value(new_values[i])
+
+    def _shift_values_by_time_clean(self, dt):
+        """Safe variant of shift_values_by_time for clean_model='delete' models.
+
+        Iterates only over each variable's existing VarData entries (via
+        var._data.keys()) instead of the full ContinuousSet.  This avoids
+        accessing deleted entries via var[t], which would silently re-create them.
+        """
         seen = set()
-        t0 = self.time.first()
-        tf = self.time.last()
-        time_map = {}
-        time_list = list(self.time)
+        time_list = sorted(self.time)  # full ordered time list for snapping t+dt
         for var in self._dae_vars:
-            if id(var[tf]) in seen:
-                # Assume that if var[tf] has been encountered, this is a
-                # reference to a "variable" we have already processed.
+            # Collect only the time keys that actually exist in this variable.
+            var_keys = sorted(var._data.keys())
+            if not var_keys:
                 continue
-            else:
-                seen.add(id(var[tf]))
-            new_values = []
-            for t in time_list:
+            # Dedup: use the id of the first existing VarData as a sentinel.
+            # (var[var_keys[0]] is safe because the key is known to exist.)
+            sentinel_id = id(var[var_keys[0]])
+            if sentinel_id in seen:
+                continue
+            seen.add(sentinel_id)
+            # Build a per-variable map: for each existing key t, what existing
+            # key should we read from after shifting by dt?
+            time_map = {}
+            for t in var_keys:
                 if t not in time_map:
-                    # Build up a map from target to source time points,
-                    # as I don't want to call find_nearest_index more
-                    # frequently than I have to.
-                    t_new = t + dt
-                    idx = find_nearest_index(time_list, t_new, tolerance=None)
-                    # If t_new is not a valid time point, we proceed with the
-                    # closest valid time point.
-                    # We're relying on the fact that indices of t0 or tf are
-                    # returned if t_new is outside the bounds of the time set.
-                    t_new = time_list[idx]
-                    time_map[t] = t_new
-                t_new = time_map[t]
-                new_values.append(var[t_new].value)
-            for i, t in enumerate(self.time):
-                var[t].set_value(new_values[i])
+                    t_shifted = t + dt
+                    # Snap t_shifted to the nearest point in the full time set.
+                    idx = find_nearest_index(time_list, t_shifted, tolerance=None)
+                    t_snapped = time_list[idx]
+                    # If that snapped point was deleted from this variable, fall
+                    # back to the nearest point among this variable's existing keys.
+                    if t_snapped not in var._data:
+                        idx2 = find_nearest_index(var_keys, t_shifted, tolerance=None)
+                        t_snapped = var_keys[idx2]
+                    time_map[t] = t_snapped
+            # Collect new values first, then assign (avoids using overwritten values).
+            new_values = [var[time_map[t]].value for t in var_keys]
+            for t, val in zip(var_keys, new_values):
+                var[t].set_value(val)
 
     def get_penalty_from_target(
         self,
@@ -397,6 +512,11 @@ class DynamicModelInterface:
             find_nearest_index(time_list, t, tolerance=tolerance) for t in sample_points
         ]
         sample_points = [time_list[i] for i in sample_point_indices]
-        return get_piecewise_constant_constraints(
-            variables, self.time, sample_points, use_next=use_next
-        )
+        if self._clean_model:
+            return get_piecewise_constant_constraints_clean(
+                variables, self.time, sample_points, use_next=use_next
+            )
+        else:
+            return get_piecewise_constant_constraints(
+                variables, self.time, sample_points, use_next=use_next
+            )
