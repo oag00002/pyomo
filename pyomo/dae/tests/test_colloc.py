@@ -10,7 +10,20 @@
 
 import pyomo.common.unittest as unittest
 
-from pyomo.environ import Var, Set, ConcreteModel, TransformationFactory, pyomo
+from pyomo.environ import (
+    Block,
+    ConcreteModel,
+    Constraint,
+    Objective,
+    Set,
+    SolverFactory,
+    Suffix,
+    TransformationFactory,
+    Var,
+    value,
+    pyomo,
+)
+from pyomo.core.expr import identify_variables
 from pyomo.dae import ContinuousSet, DerivativeVar
 from pyomo.dae.diffvar import DAE_Error
 
@@ -724,6 +737,220 @@ class TestCollocation(unittest.TestCase):
 
         self.assertTrue(hasattr(m3, 'u_interpolation_constraints'))
         self.assertEqual(len(m3.u_interpolation_constraints), 15)
+
+
+class TestCleanModel(unittest.TestCase):
+    """
+    Class for testing the clean_model option of the collocation
+    discretization
+    """
+
+    def _make_model(self):
+        # v1 is a state, dv1 its derivative, v2 an algebraic variable
+        m = ConcreteModel()
+        m.t = ContinuousSet(bounds=(0, 10))
+        m.v1 = Var(m.t)
+        m.dv1 = DerivativeVar(m.v1)
+        m.v2 = Var(m.t)
+        m.ode = Constraint(m.t, rule=lambda m, t: m.dv1[t] == -m.v1[t])
+        m.alg = Constraint(m.t, rule=lambda m, t: m.v2[t] == m.v1[t] ** 2)
+        return m
+
+    def test_default_is_no_cleanup(self):
+        m = self._make_model()
+        disc = TransformationFactory('dae.collocation')
+        disc.apply_to(m, nfe=2, ncp=2)
+        for t in m.t:
+            self.assertIn(t, m.ode)
+            self.assertIn(t, m.alg)
+            self.assertIn(t, m.dv1)
+            self.assertIn(t, m.v2)
+
+    def test_clean_model(self):
+        # For LAGRANGE-RADAU the only non-collocation point is the initial
+        # point. For LAGRANGE-LEGENDRE every finite element boundary is one.
+        for scheme, n_disc_eq, n_cont_eq in [
+            ('LAGRANGE-RADAU', 4, 0),
+            ('LAGRANGE-LEGENDRE', 4, 2),
+        ]:
+            with self.subTest(scheme=scheme):
+                m = self._make_model()
+                disc = TransformationFactory('dae.collocation')
+                disc.apply_to(m, nfe=2, ncp=2, scheme=scheme, clean_model=True)
+
+                if scheme == 'LAGRANGE-RADAU':
+                    non_colloc = {m.t.first()}
+                else:
+                    non_colloc = set(m.t.get_finite_elements())
+                self.assertEqual(set(m.t) - set(m.dv1), non_colloc)
+
+                for t in non_colloc:
+                    self.assertNotIn(t, m.ode)
+                    self.assertNotIn(t, m.alg)
+                    self.assertNotIn(t, m.dv1)
+                    self.assertNotIn(t, m.v2)
+                    # The state variable is preserved everywhere: the initial
+                    # conditions and the continuity equations need it.
+                    self.assertIn(t, m.v1)
+                for t in set(m.t) - non_colloc:
+                    self.assertIn(t, m.ode)
+                    self.assertIn(t, m.alg)
+                    self.assertIn(t, m.dv1)
+                    self.assertIn(t, m.v2)
+
+                # Discretization and continuity equations are untouched
+                self.assertEqual(len(m.dv1_disc_eq), n_disc_eq)
+                if n_cont_eq:
+                    self.assertEqual(len(m.v1_t_cont_eq), n_cont_eq)
+
+    def test_clean_model_multi_index(self):
+        # The ContinuousSet is not the first index of u
+        m = self._make_model()
+        m.s = Set(initialize=[1, 2, 3])
+        m.u = Var(m.s, m.t)
+        m.alg2 = Constraint(m.s, m.t, rule=lambda m, s, t: m.u[s, t] == m.v1[t])
+
+        disc = TransformationFactory('dae.collocation')
+        disc.apply_to(m, nfe=1, ncp=2, clean_model=True)
+
+        t0 = m.t.first()
+        for s in m.s:
+            self.assertNotIn((s, t0), m.u)
+            self.assertNotIn((s, t0), m.alg2)
+        self.assertIn(t0, m.v1)
+
+    def test_clean_model_preserves_scalar_constraint(self):
+        m = self._make_model()
+        m.ic = Constraint(expr=m.v1[0] == 1.0)
+        disc = TransformationFactory('dae.collocation')
+        disc.apply_to(m, nfe=2, ncp=2, clean_model=True)
+        self.assertTrue(m.ic.active)
+        self.assertIn(m.t.first(), m.v1)
+
+    def test_clean_model_multiple_contsets_error(self):
+        m = self._make_model()
+        m.z = ContinuousSet(bounds=(0, 1))
+        m.v3 = Var(m.z)
+        m.dv3 = DerivativeVar(m.v3, wrt=m.z)
+        m.ode3 = Constraint(m.z, rule=lambda m, z: m.dv3[z] == -m.v3[z])
+
+        disc = TransformationFactory('dae.collocation')
+        with self.assertRaisesRegex(DAE_Error, 'more than one ContinuousSet'):
+            disc.apply_to(m, wrt=m.t, nfe=2, ncp=2, clean_model=True)
+
+    def test_clean_model_indexed_block_error(self):
+        m = self._make_model()
+        m.b = Block(m.t)
+        disc = TransformationFactory('dae.collocation')
+        with self.assertRaisesRegex(DAE_Error, 'Block indexed by a ContinuousSet'):
+            disc.apply_to(m, nfe=2, ncp=2, clean_model=True)
+
+
+class TestStructuralReduceCollocationPoints(unittest.TestCase):
+    """
+    Class for testing the structural option of reduce_collocation_points
+    """
+
+    def _make_model(self, nfe=4, ncp=3):
+        m = ConcreteModel()
+        m.t = ContinuousSet(bounds=(0, 10))
+        m.v = Var(m.t, initialize=1.0)
+        m.dv = DerivativeVar(m.v, wrt=m.t)
+        m.u = Var(m.t, bounds=(-5, 5), initialize=0.0)
+        m.ode = Constraint(m.t, rule=lambda m, t: m.dv[t] == -m.v[t] ** 2 + m.u[t])
+        m.obj = Objective(
+            expr=sum((m.v[t] - 2.0) ** 2 for t in m.t)
+            + 0.1 * sum(m.u[t] ** 2 for t in m.t)
+        )
+        disc = TransformationFactory('dae.collocation')
+        disc.apply_to(m, nfe=nfe, ncp=ncp)
+        m.v[0].fix(1.0)
+        return m, disc
+
+    def test_structural_writes_no_interpolation_constraints(self):
+        nfe = 4
+        m, disc = self._make_model(nfe=nfe, ncp=3)
+        n_before = len(m.u)
+        disc.reduce_collocation_points(m, var=m.u, ncp=1, contset=m.t, structural=True)
+        # No interpolation constraints are generated at all
+        self.assertEqual(len(m.u_interpolation_constraints), 0)
+        # One entry per finite element, plus the initial point, rather than
+        # one entry per collocation point
+        self.assertEqual(len(m.u), nfe + 1)
+        self.assertLess(len(m.u), n_before)
+        # Every remaining reference to u resolves to a surviving entry
+        live = set(id(m.u[i]) for i in m.u)
+        for con in m.component_data_objects(Constraint, active=True):
+            for v in identify_variables(con.body):
+                if v.parent_component() is m.u:
+                    self.assertIn(id(v), live)
+
+    def test_structural_false_is_unchanged(self):
+        # The default and an explicit structural=False must agree
+        m1, disc1 = self._make_model()
+        disc1.reduce_collocation_points(m1, var=m1.u, ncp=1, contset=m1.t)
+        m2, disc2 = self._make_model()
+        disc2.reduce_collocation_points(
+            m2, var=m2.u, ncp=1, contset=m2.t, structural=False
+        )
+        self.assertEqual(len(m1.u), len(m2.u))
+        self.assertEqual(
+            len(m1.u_interpolation_constraints), len(m2.u_interpolation_constraints)
+        )
+        for i in m1.u_interpolation_constraints:
+            self.assertEqual(
+                str(m1.u_interpolation_constraints[i].expr),
+                str(m2.u_interpolation_constraints[i].expr),
+            )
+
+    def test_structural_requires_ncp_1(self):
+        m, disc = self._make_model()
+        with self.assertRaisesRegex(NotImplementedError, 'only.*implemented for ncp=1'):
+            disc.reduce_collocation_points(
+                m, var=m.u, ncp=2, contset=m.t, structural=True
+            )
+
+    @unittest.skipIf(
+        not SolverFactory('ipopt').available(False), "ipopt is not available"
+    )
+    def test_structural_matches_algebraic(self):
+        # The structural reduction must be a pure symbol swap: same solution,
+        # fewer rows and columns, and duals still available.
+        #
+        # Note that duals require the writer's linear presolve to be off. That
+        # is not specific to the interpolation constraints: the discretization
+        # equations of any collocation model define the derivative variables
+        # linearly, so a presolve that eliminates variables will always
+        # eliminate those. A consumer that needs duals therefore cannot
+        # presolve the redundant interpolation rows away either, which is what
+        # makes not writing them worthwhile.
+        results = {}
+        for structural in (False, True):
+            m, disc = self._make_model()
+            disc.reduce_collocation_points(
+                m, var=m.u, ncp=1, contset=m.t, structural=structural
+            )
+            m.dual = Suffix(direction=Suffix.IMPORT)
+            solver = SolverFactory('ipopt')
+            solver.solve(m)
+            results[structural] = dict(
+                obj=value(m.obj),
+                v=[m.v[t].value for t in m.t],
+                n_var=len(list(m.component_data_objects(Var, active=True))),
+                n_con=len(list(m.component_data_objects(Constraint, active=True))),
+                n_dual=len(m.dual),
+            )
+
+        alg, struct = results[False], results[True]
+        # The two formulations are different NLPs with the same solution, so
+        # they agree to solver tolerance rather than exactly.
+        self.assertAlmostEqual(alg['obj'], struct['obj'], delta=1e-6)
+        for v_alg, v_struct in zip(alg['v'], struct['v']):
+            self.assertAlmostEqual(v_alg, v_struct, delta=1e-4)
+        # Fewer variables and fewer constraints, and duals are still returned
+        self.assertLess(struct['n_var'], alg['n_var'])
+        self.assertLess(struct['n_con'], alg['n_con'])
+        self.assertEqual(struct['n_dual'], struct['n_con'])
 
 
 if __name__ == '__main__':

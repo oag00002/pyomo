@@ -46,4 +46,10 @@ def copy_values_at_time(
             # for variables. However, it raises an error if the expression
             # cannot be evaluated (e.g. has value None).
             # t_var[t_t].set_value(pyo_value(s_var[s_t]))
-            t_var[t_t].set_value(s_var[s_t].value)
+            #
+            # Both accesses are guarded so that a variable that does not have
+            # an entry at every time point (see load_data.py) is neither read
+            # nor written at the missing points. On a variable that has every
+            # entry, the guard is a no-op.
+            if s_t in s_var and t_t in t_var:
+                t_var[t_t].set_value(s_var[s_t].value)

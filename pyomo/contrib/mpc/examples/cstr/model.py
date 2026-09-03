@@ -81,14 +81,38 @@ def make_model(dynamic=True, horizon=10.0):
     return m
 
 
-def initialize_model(m, dynamic=True, ntfe=None):
+def initialize_model(
+    m,
+    dynamic=True,
+    ntfe=None,
+    discretizer="dae.finite_difference",
+    ncp=3,
+    clean_model=False,
+):
+    """Discretize and initialize the CSTR model
+
+    discretizer is either "dae.finite_difference" (the default, BACKWARD
+    scheme) or "dae.collocation" (LAGRANGE-RADAU). ncp and clean_model are
+    passed to dae.collocation and ignored otherwise.
+
+    """
     if ntfe is not None and not dynamic:
         raise RuntimeError("Cannot provide ntfe to initialize steady model")
     elif dynamic and ntfe is None:
         ntfe = 10
     if dynamic:
-        disc = pyo.TransformationFactory("dae.finite_difference")
-        disc.apply_to(m, wrt=m.time, nfe=ntfe, scheme="BACKWARD")
+        disc = pyo.TransformationFactory(discretizer)
+        if discretizer == "dae.collocation":
+            disc.apply_to(
+                m,
+                wrt=m.time,
+                nfe=ntfe,
+                ncp=ncp,
+                scheme="LAGRANGE-RADAU",
+                clean_model=clean_model,
+            )
+        else:
+            disc.apply_to(m, wrt=m.time, nfe=ntfe, scheme="BACKWARD")
 
     t0 = m.time.first()
 
@@ -96,7 +120,11 @@ def initialize_model(m, dynamic=True, ntfe=None):
     m.conc_in[:, "A"].fix(5.0)
     m.conc_in[:, "B"].fix(0.01)
     m.flow_in[:].fix(1.0)
-    m.flow_in[t0].fix(0.1)
+    if t0 in m.flow_in:
+        # With clean_model, flow_in has no entry at the initial point: the
+        # equations that would use it were removed. A bare m.flow_in[t0] here
+        # would create the entry again.
+        m.flow_in[t0].fix(0.1)
 
     if dynamic:
         # Fix initial conditions if dynamic
@@ -104,13 +132,27 @@ def initialize_model(m, dynamic=True, ntfe=None):
         m.conc[t0, "B"].fix(0.0)
 
 
-def create_instance(dynamic=True, horizon=None, ntfe=None):
+def create_instance(
+    dynamic=True,
+    horizon=None,
+    ntfe=None,
+    discretizer="dae.finite_difference",
+    ncp=3,
+    clean_model=False,
+):
     if horizon is None and dynamic:
         horizon = 10.0
     if ntfe is None and dynamic:
         ntfe = 10
     m = make_model(horizon=horizon, dynamic=dynamic)
-    initialize_model(m, ntfe=ntfe, dynamic=dynamic)
+    initialize_model(
+        m,
+        ntfe=ntfe,
+        dynamic=dynamic,
+        discretizer=discretizer,
+        ncp=ncp,
+        clean_model=clean_model,
+    )
     return m
 
 

@@ -37,11 +37,28 @@ def run_cstr_mpc(
     ntfe_per_sample_controller=2,
     ntfe_plant=5,
     simulation_steps=5,
+    discretizer="dae.finite_difference",
+    ncp=3,
+    clean_model=False,
     tee=False,
 ):
+    """Run a rolling-horizon MPC simulation of the CSTR
+
+    discretizer, ncp, and clean_model are applied to the controller model
+    only; the plant is always discretized with finite difference. Returns
+    (m_controller, m_plant, sim_data); the controller model is returned so
+    that callers can check it after the loop, e.g. for re-created entries.
+
+    """
     controller_horizon = sample_time * samples_per_controller_horizon
     ntfe = ntfe_per_sample_controller * samples_per_controller_horizon
-    m_controller = create_instance(horizon=controller_horizon, ntfe=ntfe)
+    m_controller = create_instance(
+        horizon=controller_horizon,
+        ntfe=ntfe,
+        discretizer=discretizer,
+        ncp=ncp,
+        clean_model=clean_model,
+    )
     controller_interface = mpc.DynamicModelInterface(m_controller, m_controller.time)
     t0_controller = m_controller.time.first()
 
@@ -74,7 +91,8 @@ def run_cstr_mpc(
     # Unfix input in controller model
     #
     m_controller.flow_in[:].unfix()
-    m_controller.flow_in[t0_controller].fix()
+    if t0_controller in m_controller.flow_in:
+        m_controller.flow_in[t0_controller].fix()
     sample_points = [i * sample_time for i in range(samples_per_controller_horizon + 1)]
     input_set, pwc_con = controller_interface.get_piecewise_constant_constraints(
         [m_controller.flow_in], sample_points
@@ -133,7 +151,7 @@ def run_cstr_mpc(
         controller_interface.shift_values_by_time(sample_time)
         controller_interface.load_data(tf_data, time_points=t0_controller)
 
-    return m_plant, sim_data
+    return m_controller, m_plant, sim_data
 
 
 def main():
@@ -142,7 +160,7 @@ def main():
     setpoint_target = mpc.ScalarData({"flow_in[*]": 1.2})
     setpoint_data = get_steady_state_data(setpoint_target, tee=False)
 
-    m, sim_data = run_cstr_mpc(init_data, setpoint_data, tee=False)
+    _, m, sim_data = run_cstr_mpc(init_data, setpoint_data, tee=False)
 
     _plot_time_indexed_variables(sim_data, [m.conc[:, "A"], m.conc[:, "B"]], show=True)
     _step_time_indexed_variables(sim_data, [m.flow_in[:]], show=True)
