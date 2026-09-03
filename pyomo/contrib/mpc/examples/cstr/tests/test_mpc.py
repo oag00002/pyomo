@@ -10,6 +10,7 @@
 import pyomo.common.unittest as unittest
 import pyomo.environ as pyo
 import pyomo.contrib.mpc as mpc
+from pyomo.contrib.mpc.examples.cstr.model import create_instance
 from pyomo.contrib.mpc.examples.cstr.run_mpc import get_steady_state_data, run_cstr_mpc
 
 ipopt_available = pyo.SolverFactory("ipopt").available()
@@ -93,7 +94,7 @@ class TestCSTRMPC(unittest.TestCase):
         ntfe_per_sample = 2
         ntfe_plant = 5
         simulation_steps = 5
-        m_plant, sim_data = run_cstr_mpc(
+        _, m_plant, sim_data = run_cstr_mpc(
             initial_data,
             setpoint_data,
             samples_per_controller_horizon=samples_per_horizon,
@@ -119,6 +120,82 @@ class TestCSTRMPC(unittest.TestCase):
         self.assertStructuredAlmostEqual(
             sim_time_points, AB_data.get_time_points(), delta=1e-7
         )
+
+
+@unittest.skipIf(not ipopt_available, "ipopt is not available")
+class TestCSTRCollocationMPC(unittest.TestCase):
+    """MPC with a controller model discretized by collocation
+
+    With clean_model=True the controller model has no entries at
+    non-collocation points. These tests check that the MPC loop neither
+    re-creates those entries nor changes the answer.
+    """
+
+    _sample_time = 2.0
+    _samples_per_horizon = 5
+    _ntfe_per_sample = 2
+    _ntfe_plant = 5
+    _simulation_steps = 5
+    _ncp = 3
+
+    def _run_mpc(self, clean_model):
+        return run_cstr_mpc(
+            get_steady_state_data(mpc.ScalarData({"flow_in[*]": 0.3})),
+            get_steady_state_data(mpc.ScalarData({"flow_in[*]": 1.2})),
+            samples_per_controller_horizon=self._samples_per_horizon,
+            sample_time=self._sample_time,
+            ntfe_per_sample_controller=self._ntfe_per_sample,
+            ntfe_plant=self._ntfe_plant,
+            simulation_steps=self._simulation_steps,
+            discretizer="dae.collocation",
+            ncp=self._ncp,
+            clean_model=clean_model,
+        )
+
+    def _make_controller(self, clean_model):
+        return create_instance(
+            horizon=self._sample_time * self._samples_per_horizon,
+            ntfe=self._ntfe_per_sample * self._samples_per_horizon,
+            discretizer="dae.collocation",
+            ncp=self._ncp,
+            clean_model=clean_model,
+        )
+
+    @staticmethod
+    def _var_sizes(m):
+        return {v.local_name: len(v) for v in m.component_objects(pyo.Var)}
+
+    def test_model_size_consistent(self):
+        # The variable entries deleted at construction must still be absent
+        # after a full MPC loop. Every access in contrib.mpc goes through
+        # var[t], which would silently re-create them.
+        ref_sizes = self._var_sizes(self._make_controller(clean_model=True))
+        full_sizes = self._var_sizes(self._make_controller(clean_model=False))
+        self.assertTrue(
+            any(ref_sizes[key] < full_sizes[key] for key in ref_sizes),
+            "clean_model=True did not remove any variable entries",
+        )
+
+        m_controller, _, _ = self._run_mpc(clean_model=True)
+        self.assertEqual(ref_sizes, self._var_sizes(m_controller))
+
+    def test_simulation_matches_full_model(self):
+        # Removing entries that participate in no equation must not change
+        # the trajectory the controller produces.
+        _, m_plant, sim_full = self._run_mpc(clean_model=False)
+        _, _, sim_clean = self._run_mpc(clean_model=True)
+
+        n_time_points = self._simulation_steps * self._ntfe_plant + 1
+        self.assertEqual(len(sim_full.get_time_points()), n_time_points)
+        self.assertEqual(len(sim_clean.get_time_points()), n_time_points)
+
+        for var in (m_plant.conc[:, "A"], m_plant.conc[:, "B"], m_plant.flow_in[:]):
+            cuid = sim_full.get_cuid(var)
+            self.assertStructuredAlmostEqual(
+                sim_full.get_data_from_key(cuid),
+                sim_clean.get_data_from_key(cuid),
+                delta=1e-4,
+            )
 
 
 if __name__ == "__main__":

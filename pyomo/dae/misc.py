@@ -9,7 +9,7 @@
 
 import logging
 
-from pyomo.common.collections import ComponentMap
+from pyomo.common.collections import ComponentMap, ComponentSet
 from pyomo.common.log import LoggingIntercept
 from pyomo.core import Suffix, Var, Constraint, Piecewise, Block
 from pyomo.core import Expression, Param
@@ -448,19 +448,14 @@ def get_index_information(var, ds):
     dsindex = 0
 
     if var.dim() != 1:
-        indCount = 0
+        pos = get_contset_position(var, ds)
+        dsindex = 0 if pos is None else pos
         for index in var.index_set().subsets():
-            if isinstance(index, ContinuousSet):
-                if index is ds:
-                    dsindex = indCount
-                else:
-                    # If var is indexed by multiple ContinuousSets treat
-                    # other ContinuousSets like a normal indexing set
-                    indargs.append(index)
-                indCount += 1  # A ContinuousSet must be one dimensional
-            else:
-                indargs.append(index)
-                indCount += index.dimen
+            if isinstance(index, ContinuousSet) and index is ds:
+                continue
+            # If var is indexed by multiple ContinuousSets treat the other
+            # ContinuousSets like a normal indexing set
+            indargs.append(index)
 
     if indargs == []:
         non_ds = (None,)
@@ -505,3 +500,166 @@ def _get_idx(l, ds, n, i, k):
         if not isinstance(n, tuple):
             tmpn = (n,)
     return tmpn[0:l] + (tik,) + tmpn[l:]
+
+
+def get_contset_position(comp, ds):
+    """
+    Return the position of a ContinuousSet within a component's index.
+
+    Returns the position of ds in comp's flattened index tuple, or None if
+    comp is not indexed by ds.
+    """
+    if comp.dim() == 0:
+        return None
+    pos = 0
+    for subset in comp.index_set().subsets():
+        if subset is ds:
+            return pos
+        pos += subset.dimen or 1
+    return None
+
+
+def get_non_collocation_points(d, ds):
+    """
+    Return the values of ContinuousSet ds that are not collocation points.
+
+    The discretization equation added for a DerivativeVar ('<name>_disc_eq')
+    is skipped wherever the collocation scheme leaves the derivative
+    undefined: the initial point for LAGRANGE-RADAU, and every finite element
+    boundary for LAGRANGE-LEGENDRE. Reading the points off the discretization
+    equation rather than off the scheme name keeps this helper scheme-agnostic
+    and avoids duplicating the skip logic in _lagrange_radau_transform and
+    _lagrange_legendre_transform.
+
+    Parameters
+    ----------
+    d : a DerivativeVar that has been reclassified as a Var
+    ds : ContinuousSet
+    """
+    disc_eq = d.parent_block().find_component(d.local_name + '_disc_eq')
+    loc = get_contset_position(d, ds)
+    if disc_eq is None or loc is None:
+        return set()
+
+    colloc_points = set()
+    for idx in disc_eq:
+        colloc_points.add(idx[loc] if isinstance(idx, tuple) else idx)
+    return set(ds) - colloc_points
+
+
+def delete_at_contset_values(comp, ds, values):
+    """
+    Delete the entries of an indexed component at the given ContinuousSet
+    values.
+
+    Components that are scalar or not indexed by ds are left untouched.
+    Returns the number of entries that were deleted.
+
+    Parameters
+    ----------
+    comp : an indexed Pyomo component (Var or Constraint)
+    ds : ContinuousSet
+    values : set of values of ds at which to delete entries
+    """
+    if not values or not comp.is_indexed():
+        return 0
+    loc = get_contset_position(comp, ds)
+    if loc is None:
+        return 0
+
+    count = 0
+    for idx in list(comp):
+        val = idx[loc] if isinstance(idx, tuple) else idx
+        if val in values:
+            del comp[idx]
+            count += 1
+    return count
+
+
+def validate_clean_model(block):
+    """
+    Raise a DAE_Error if block is outside the scope supported by clean_model.
+
+    Deleting components at non-collocation points is only well defined for a
+    model with a single ContinuousSet whose components do not live inside
+    Blocks indexed by that set. Both cases are hard errors rather than
+    warnings: cleanup would silently delete entries the model needs (for
+    example the spatial boundary conditions of a PDE), and a silently wrong
+    model is worse than no cleanup at all. Discretize such models with
+    clean_model=False.
+    """
+    contsets = list(block.component_objects(ContinuousSet, descend_into=True))
+    if len(contsets) > 1:
+        raise DAE_Error(
+            "clean_model=True is not supported for models with more than one "
+            "ContinuousSet (found %s). Deleting components at the "
+            "non-collocation points of one ContinuousSet can remove entries "
+            "that are required in another dimension, such as the spatial "
+            "boundary conditions of a PDE. Discretize this model with "
+            "clean_model=False." % tostr([ds.name for ds in contsets])
+        )
+    if not contsets:
+        return
+    ds = contsets[0]
+    for b in block.component_objects(Block, descend_into=True):
+        if b.is_indexed() and get_contset_position(b, ds) is not None:
+            raise DAE_Error(
+                "clean_model=True is not supported for models containing a "
+                "Block indexed by a ContinuousSet (Block '%s' is indexed by "
+                "'%s'). Discretize this model with clean_model=False."
+                % (b.name, ds.name)
+            )
+
+
+def delete_model_at_non_colloc_points(block, reclassified_list):
+    """
+    Delete variable and constraint entries at non-collocation points.
+
+    A collocation transformation expands the model's equations to every point
+    of the ContinuousSet, including the points where the scheme does not
+    define the derivative. The derivative and algebraic variable entries at
+    those points appear in no meaningful equation, so they enter the NLP as
+    free variables with no objective contribution and are returned by the
+    solver at whatever value they were initialized to. This function removes
+    them, along with the user equations written at those points.
+
+    State variable entries are preserved everywhere: they are needed by the
+    initial conditions and, for LAGRANGE-LEGENDRE, by the continuity
+    equations. The discretization ('*_disc_eq') and continuity ('*_cont_eq')
+    equations are preserved for the same reason. Scalar (non-indexed)
+    constraints, such as an initial condition written as a scalar equation,
+    are never touched.
+
+    Parameters
+    ----------
+    block : Pyomo Block
+    reclassified_list : list
+        The _pyomo_dae_reclassified_derivativevars list from block, containing
+        the DerivativeVar components that were reclassified as Var.
+    """
+    contsets = ComponentSet()
+    for d in reclassified_list:
+        contsets.update(d.get_continuousset_list())
+    if len(contsets) != 1:
+        # Nothing was discretized, or validate_clean_model was not called.
+        return
+    ds = next(iter(contsets))
+
+    non_colloc = set()
+    state_vars = ComponentSet()
+    for d in reclassified_list:
+        state_vars.add(d.get_state_var())
+        non_colloc.update(get_non_collocation_points(d, ds))
+    if not non_colloc:
+        return
+
+    protected = ('_disc_eq', '_cont_eq')
+    for con in block.component_objects(Constraint, descend_into=True):
+        if any(con.local_name.endswith(s) for s in protected):
+            continue
+        delete_at_contset_values(con, ds, non_colloc)
+
+    for var in block.component_objects(Var, descend_into=True):
+        if var in state_vars:
+            continue
+        delete_at_contset_values(var, ds, non_colloc)

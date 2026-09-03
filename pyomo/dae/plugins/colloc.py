@@ -19,7 +19,8 @@ from pyomo.common.dependencies import numpy, numpy_available
 from pyomo.common.collections import ComponentSet
 
 from pyomo.core.base import Transformation, TransformationFactory
-from pyomo.core import Var, ConstraintList, Expression, Objective
+from pyomo.core import Constraint, Var, ConstraintList, Expression, Objective
+from pyomo.core.expr import replace_expressions
 from pyomo.dae import ContinuousSet, DerivativeVar, Integral
 
 from pyomo.dae.misc import generate_finite_elements
@@ -30,6 +31,9 @@ from pyomo.dae.misc import add_discretization_equations
 from pyomo.dae.misc import add_continuity_equations
 from pyomo.dae.misc import block_fully_discretized
 from pyomo.dae.misc import get_index_information
+from pyomo.dae.misc import delete_at_contset_values
+from pyomo.dae.misc import delete_model_at_non_colloc_points
+from pyomo.dae.misc import validate_clean_model
 from pyomo.dae.diffvar import DAE_Error
 
 from pyomo.common.config import ConfigBlock, ConfigValue, PositiveInt, In
@@ -253,6 +257,35 @@ def calc_afinal(cp):
     return afinal
 
 
+def _substitute_variables(instance, substitution_map):
+    """
+    Replace variables throughout a model's expressions.
+
+    substitution_map maps the id() of a VarData to the VarData that should
+    take its place. Named Expressions are updated in place rather than being
+    inlined into the constraints that use them.
+    """
+    if not substitution_map:
+        return
+
+    def _replace(expr):
+        return replace_expressions(
+            expr,
+            substitution_map,
+            descend_into_named_expressions=False,
+            remove_named_expressions=False,
+        )
+
+    # replace_expressions returns the original object when it makes no
+    # substitution, so components that do not reference an eliminated
+    # variable are left exactly as they were.
+    for ctype in (Expression, Constraint, Objective):
+        for comp in instance.component_data_objects(ctype, descend_into=True):
+            new_expr = _replace(comp.expr)
+            if new_expr is not comp.expr:
+                comp.set_value(new_expr)
+
+
 @TransformationFactory.register(
     'dae.collocation',
     doc="Discretizes a DAE model using orthogonal collocation over"
@@ -296,6 +329,22 @@ class Collocation_Discretization_Transformation(Transformation):
             description="Indicates which collocation scheme to apply",
             doc="Options are 'LAGRANGE-RADAU' and 'LAGRANGE-LEGENDRE'. "
             "The default scheme is Lagrange polynomials with Radau roots",
+        ),
+    )
+
+    CONFIG.declare(
+        'clean_model',
+        ConfigValue(
+            default=False,
+            domain=bool,
+            description="Delete model components at non-collocation points",
+            doc="If True, delete the variable and constraint entries that the "
+            "collocation scheme leaves undefined at non-collocation points "
+            "(the initial point for LAGRANGE-RADAU; every finite element "
+            "boundary for LAGRANGE-LEGENDRE). State variables, discretization "
+            "equations, and continuity equations are preserved. Only supported "
+            "for models with a single ContinuousSet and no Blocks indexed by "
+            "it; anything else raises a DAE_Error.",
         ),
     )
 
@@ -453,6 +502,7 @@ class Collocation_Discretization_Transformation(Transformation):
 
         self._scheme_name = config.scheme
         self._scheme = self.all_schemes.get(self._scheme_name, None)
+        self._clean_model = config.clean_model
 
         if self._scheme_name == 'LAGRANGE-RADAU':
             self._get_radau_constants(currentds)
@@ -462,6 +512,11 @@ class Collocation_Discretization_Transformation(Transformation):
         self._transformBlock(instance, currentds)
 
     def _transformBlock(self, block, currentds):
+        # Validate before the model is modified so that an unsupported model
+        # is rejected rather than half-transformed.
+        if self._clean_model:
+            validate_clean_model(block)
+
         self._fe = {}
         for ds in block.component_objects(ContinuousSet, descend_into=True):
             if currentds is None or currentds == ds.name:
@@ -569,11 +624,24 @@ class Collocation_Discretization_Transformation(Transformation):
                     k._constructed = False
                     k.construct()
 
-    def reduce_collocation_points(self, instance, var=None, ncp=None, contset=None):
+        if self._clean_model:
+            delete_model_at_non_colloc_points(
+                block, getattr(block, '_pyomo_dae_reclassified_derivativevars', [])
+            )
+
+    def reduce_collocation_points(
+        self, instance, var=None, ncp=None, contset=None, structural=False
+    ):
         """
-        This method will add additional constraints to a model to reduce the
-        number of free collocation points (degrees of freedom) for a particular
-        variable.
+        This method will reduce the number of free collocation points (degrees
+        of freedom) for a particular variable.
+
+        By default the reduction is algebraic: interpolation constraints
+        equating the eliminated collocation points to the retained ones are
+        added to a ``ConstraintList``. With ``structural=True`` (``ncp=1``
+        only) the eliminated points are instead substituted out of the model
+        equations and deleted, so that no interpolation constraints, and no
+        redundant variables, are ever written.
 
         Parameters
         ----------
@@ -592,6 +660,18 @@ class Collocation_Discretization_Transformation(Transformation):
             The :py:class:`ContinuousSet<pyomo.dae.ContinuousSet>` that was
             discretized and for which the `var` will have a reduced number
             of degrees of freedom
+
+        structural : bool
+            If True, eliminate the redundant collocation points structurally
+            rather than algebraically: every reference to an eliminated point
+            is replaced by the retained point of the same finite element and
+            the orphaned ``VarData`` entries are deleted. The rows, columns
+            *and* duals of the interpolation constraints all disappear, which
+            matters for a consumer that must have complete duals available and
+            therefore cannot use a presolve that eliminates variables. Only
+            implemented for ``ncp=1``; raises ``NotImplementedError``
+            otherwise. The default, False, reproduces the existing behavior
+            exactly.
 
         """
         if contset is None:
@@ -643,6 +723,15 @@ class Collocation_Discretization_Transformation(Transformation):
         if ncp == tot_ncp:
             # Nothing to be done
             return instance
+        if structural and ncp != 1:
+            raise NotImplementedError(
+                "reduce_collocation_points with structural=True is only "
+                "implemented for ncp=1. For ncp >= 2 each eliminated "
+                "collocation point is a degree-(ncp-1) Lagrange combination "
+                "of the retained points, so substituting it into the model "
+                "equations makes them denser rather than smaller. Use "
+                "structural=False for ncp >= 2."
+            )
 
         # Check to see if the continuousset is an indexing set of the variable
         if var.dim() == 0:
@@ -688,13 +777,27 @@ class Collocation_Discretization_Transformation(Transformation):
         tmpidx = info['non_ds']
         idx = info['index function']
 
+        # Map from the id of an eliminated VarData to the VarData that
+        # replaces it, and the ContinuousSet values that become orphaned.
+        substitution_map = {}
+        eliminated_points = set()
+
         # Iterate over non_ds indices
         for n in tmpidx:
             # Iterate over finite elements
             for i in range(0, len(fe) - 1):
                 # Iterate over collocation points
                 for k in range(1, tot_ncp - ncp + 1):
-                    if ncp == 1:
+                    if structural:
+                        # Constant over each finite element, enforced by
+                        # writing a single VarData per finite element instead
+                        # of constraining several of them to be equal.
+                        substitution_map[id(var[idx(n, i, k)])] = var[
+                            idx(n, i, tot_ncp)
+                        ]
+                        # This is the same point _get_idx resolves (n, i, k) to
+                        eliminated_points.add(t[ds.ord(fe[i]) - 1 + k])
+                    elif ncp == 1:
                         # Constant over each finite element
                         conlist.add(var[idx(n, i, k)] == var[idx(n, i, tot_ncp)])
                     else:
@@ -710,6 +813,10 @@ class Collocation_Discretization_Transformation(Transformation):
                                 for j in range(tot_ncp - ncp + 1, tot_ncp + 1)
                             )
                         )
+
+        if structural:
+            _substitute_variables(instance, substitution_map)
+            delete_at_contset_values(var, ds, eliminated_points)
 
         return instance
 

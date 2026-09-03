@@ -7,6 +7,18 @@
 # software.  This software is distributed under the 3-clause BSD License.
 # ____________________________________________________________________________________
 
+"""Functions for loading data into a model.
+
+Every write here is guarded with ``t in var``. A time-indexed variable is not
+required to have an entry at every point of the time set: ``dae.collocation``
+with ``clean_model=True`` deletes the entries the collocation scheme leaves
+undefined at non-collocation points. Writing with a bare ``var[t]`` would
+trigger Pyomo's ``__missing__`` protocol and silently re-create those entries,
+undoing the cleanup after a single load. On a model where nothing has been
+deleted the guards are no-ops.
+
+"""
+
 from pyomo.core.base import Expression
 from pyomo.contrib.mpc.data.dynamic_data_base import _is_iterable
 from pyomo.contrib.mpc.data.find_nearest_index import (
@@ -45,7 +57,10 @@ def load_data_from_scalar(data, model, time, ignore_named_expressions=False):
         # doesn't have a list of time points to check.
         if var.is_indexed():
             for t in t_iter:
-                var[t].set_value(val)
+                # Skip time points that do not exist in this variable. See
+                # the note on sparse variables in the module docstring.
+                if t in var:
+                    var[t].set_value(val)
         else:
             var.set_value(val)
 
@@ -87,7 +102,8 @@ def load_data_from_series(
             raise TypeError("Cannot load data for named Expression")
         for idx, val in zip(time_indices, vals):
             t = time_list[idx]
-            var[t].set_value(val)
+            if t in var:
+                var[t].set_value(val)
 
 
 def load_data_from_interval(
@@ -194,5 +210,5 @@ def load_data_from_interval(
                 # We don't necessarily require that the interval data
                 # cover the entire time set.
                 continue
-            else:
+            elif t in var:
                 var[t].set_value(vals[i])

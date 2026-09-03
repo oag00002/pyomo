@@ -511,6 +511,31 @@ Additional keyword arguments for collocation discretizations:
     The number of collocation points within each finite element. The
     default value is 3.
 
+'clean_model'
+    If True, delete the model components that the collocation scheme leaves
+    undefined at non-collocation points. The default is False.
+
+.. note::
+    A collocation transformation expands the model's equations to every point
+    of the :py:class:`ContinuousSet<pyomo.dae.ContinuousSet>`, including the
+    points where the scheme does not define the derivative: the initial point
+    for 'LAGRANGE-RADAU', and every finite element boundary for
+    'LAGRANGE-LEGENDRE'. The derivative and algebraic variable entries at
+    those points appear in no meaningful equation, so a solver returns them at
+    whatever value they were initialized to, which shows up as spurious points
+    in the solution profiles. ``clean_model=True`` deletes those variable
+    entries and the user equations written at those points. State variables,
+    discretization equations, and continuity equations are preserved
+    everywhere.
+
+    Note that the resulting variables are *sparse*: they do not have an entry
+    at every point of the ContinuousSet. Accessing a missing entry as
+    ``var[t]`` creates it again, so code that writes to such a model should
+    guard its accesses with ``if t in var``. ``clean_model=True`` raises a
+    ``DAE_Error`` for models with more than one ContinuousSet, or with a Block
+    indexed by a ContinuousSet, rather than silently deleting components that
+    those models need.
+
 .. note::
     If the user's version of Python has access to the package Numpy then any
     number of collocation points may be specified, otherwise the maximum number
@@ -591,6 +616,41 @@ An example of using this function is shown below:
 In the above example, the ``reduce_collocation_points`` function restricts
 the variable ``model.u`` to have only **1** free collocation point per
 finite element, thereby enforcing a piecewise constant profile.
+By default the restriction is enforced algebraically, by adding interpolation
+constraints that equate the eliminated collocation points to the retained one.
+Passing ``structural=True`` (supported for ``ncp=1`` only) instead substitutes
+each eliminated point out of the model equations and deletes it, so that no
+interpolation constraints, and no redundant variables, are written:
+
+.. doctest::
+    :hide:
+
+    >>> model = pyo.ConcreteModel()
+    >>> model.time = ContinuousSet(bounds=(0, 10))
+    >>> model.x = pyo.Var(model.time, bounds=(-10, 10))
+    >>> model.dx = DerivativeVar(model.x)
+    >>> model.u = pyo.Var(model.time)
+    >>> model.ode = pyo.Constraint(model.time,
+    ...     rule=lambda m, t: m.dx[t] == -m.x[t] + m.u[t])
+
+.. doctest::
+
+    >>> discretizer = pyo.TransformationFactory('dae.collocation')
+    >>> discretizer.apply_to(model, nfe=10, ncp=6)
+    >>> model = discretizer.reduce_collocation_points(model,
+    ...                                               var=model.u,
+    ...                                               ncp=1,
+    ...                                               contset=model.time,
+    ...                                               structural=True)
+    >>> len(model.u_interpolation_constraints)
+    0
+
+This matters for a consumer that needs the model's duals, such as a
+warm-started model predictive controller. A writer's linear presolve can
+eliminate the redundant interpolation constraints, but a solver interface that
+has eliminated variables cannot report complete duals, so such a consumer must
+run with presolve off and would otherwise carry the redundant rows and columns
+through every solve.
 :numref:`Fig. %s <reduce_points_fig>` shows the solution profile before and
 after applying
 the ``reduce_collocation_points`` function.

@@ -133,8 +133,12 @@ class DynamicModelInterface:
         if _is_iterable(time):
             # Assume time is iterable
             time_list = list(time)
+            # A variable is not required to have an entry at every time
+            # point (see interfaces/load_data.py). Reading with a bare var[t]
+            # would silently create the missing entries, so report None for
+            # them instead.
             data = {
-                cuid: [var[t].value for t in time]
+                cuid: [var[t].value if t in var else None for t in time]
                 for cuid, var in zip(self._dae_var_cuids, self._dae_vars)
             }
             if include_expr:
@@ -148,10 +152,19 @@ class DynamicModelInterface:
             return TimeSeriesData(data, time_list, time_set=self.time)
         else:
             # time is a scalar
-            data = {
-                cuid: var[time].value
-                for cuid, var in zip(self._dae_var_cuids, self._dae_vars)
-            }
+            data = {}
+            for cuid, var in zip(self._dae_var_cuids, self._dae_vars):
+                if time in var:
+                    data[cuid] = var[time].value
+                else:
+                    # This variable has no entry at this time point. Fall back
+                    # to its nearest existing entry rather than creating one.
+                    var_keys = sorted(var._data.keys())
+                    if var_keys:
+                        idx = find_nearest_index(var_keys, time, tolerance=None)
+                        data[cuid] = var[var_keys[idx]].value
+                    else:
+                        data[cuid] = None
             if include_expr:
                 data.update(
                     {
@@ -270,23 +283,28 @@ class DynamicModelInterface:
         Shift values in time indexed variables by a specified time offset.
         """
         seen = set()
-        t0 = self.time.first()
-        tf = self.time.last()
-        time_map = {}
         time_list = list(self.time)
         for var in self._dae_vars:
-            if id(var[tf]) in seen:
-                # Assume that if var[tf] has been encountered, this is a
-                # reference to a "variable" we have already processed.
+            # Iterate over the entries this variable actually has rather than
+            # over the full time set. A variable is not required to have an
+            # entry at every time point (see interfaces/load_data.py), and a
+            # bare var[t] would silently create the missing ones.
+            var_keys = sorted(var._data.keys())
+            if not var_keys:
+                continue
+            # Assume that if this VarData has been encountered, this is a
+            # reference to a "variable" we have already processed.
+            if id(var[var_keys[0]]) in seen:
                 continue
             else:
-                seen.add(id(var[tf]))
-            new_values = []
-            for t in time_list:
+                seen.add(id(var[var_keys[0]]))
+            # Build up a map from target to source time points, as I don't
+            # want to call find_nearest_index more frequently than I have to.
+            # The map is per-variable because which points exist may differ
+            # from one variable to the next.
+            time_map = {}
+            for t in var_keys:
                 if t not in time_map:
-                    # Build up a map from target to source time points,
-                    # as I don't want to call find_nearest_index more
-                    # frequently than I have to.
                     t_new = t + dt
                     idx = find_nearest_index(time_list, t_new, tolerance=None)
                     # If t_new is not a valid time point, we proceed with the
@@ -294,11 +312,15 @@ class DynamicModelInterface:
                     # We're relying on the fact that indices of t0 or tf are
                     # returned if t_new is outside the bounds of the time set.
                     t_new = time_list[idx]
+                    if t_new not in var:
+                        # This variable has no entry at the nearest time point,
+                        # so fall back to its nearest existing entry.
+                        idx = find_nearest_index(var_keys, t + dt, tolerance=None)
+                        t_new = var_keys[idx]
                     time_map[t] = t_new
-                t_new = time_map[t]
-                new_values.append(var[t_new].value)
-            for i, t in enumerate(self.time):
-                var[t].set_value(new_values[i])
+            new_values = [var[time_map[t]].value for t in var_keys]
+            for t, val in zip(var_keys, new_values):
+                var[t].set_value(val)
 
     def get_penalty_from_target(
         self,
